@@ -1,0 +1,491 @@
+<!--
+=====================================================================
+ Divi 5 Date Picker  -  pure JS / CSS, no libraries
+=====================================================================
+ HOW TO INSTALL
+   Option A: Divi > Theme Options > Integration > "Add code to the <body>"
+   Option B: a Divi Code Module on the page (paste everything below).
+
+ HOW TO USE
+   1. In the Divi Contact Form, open the field you want to be a date
+      field and set its CSS ID (Advanced > CSS ID & Classes), e.g.
+      booking_date.  (Divi puts that ID on the field wrapper; this
+      script finds the <input> inside it automatically. If you put the
+      ID directly on an <input>, that works too.)
+   2. Add one attachDatePicker('#id') call per field (bottom of this
+      snippet). Options are optional.
+=====================================================================
+-->
+
+<style>
+/* ===================================================================
+   1. STYLES
+   Everything is prefixed ".edp" so it cannot collide with Divi.
+   Change the three brand variables to restyle the whole calendar.
+   =================================================================== */
+.edp {
+  --edp-accent: #2ea3f2;          /* selected day / hover accent (Divi blue) */
+  --edp-accent-text: #ffffff;     /* text on the accent colour               */
+  --edp-today: #2ea3f2;           /* outline used for "today"                */
+  --edp-bg: #ffffff;
+  --edp-text: #222222;
+  --edp-muted: #a0a0a0;
+  --edp-border: #dcdcdc;
+
+  position: fixed;                /* fixed + body-level = never clipped      */
+  top: 0;
+  left: 0;
+  z-index: 999999;                /* above Divi fixed headers / menus        */
+  display: none;
+  box-sizing: border-box;
+  width: 280px;
+  max-width: calc(100vw - 16px);
+  padding: 10px;
+  background: var(--edp-bg);
+  color: var(--edp-text);
+  border: 1px solid var(--edp-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+  font: 14px/1.2 "Open Sans", Arial, sans-serif;
+  text-align: center;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.edp.edp-open { display: block; }
+
+/* Defensive reset: Divi/themes style generic button/div/span rules. */
+.edp *, .edp *::before, .edp *::after { box-sizing: border-box; }
+.edp button {
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  box-shadow: none;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  text-transform: none;
+  letter-spacing: normal;
+  text-shadow: none;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* Header: prev | Month YYYY | next */
+.edp .edp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.edp .edp-title { font-weight: 700; font-size: 15px; }
+.edp .edp-nav {
+  width: 32px;
+  height: 32px;
+  font-size: 20px;
+  color: var(--edp-text);
+}
+.edp .edp-nav:hover:not(:disabled) { background: rgba(0, 0, 0, .07); }
+.edp .edp-nav:disabled { opacity: .3; cursor: default; }
+
+/* 7-column grids for weekday labels and days */
+.edp .edp-week,
+.edp .edp-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+.edp .edp-week span {
+  padding: 4px 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--edp-muted);
+}
+.edp .edp-day {
+  height: 34px;
+  font-size: 14px;
+  color: var(--edp-text);
+  border: 1px solid transparent;
+}
+.edp .edp-day:hover:not(:disabled) { background: rgba(46, 163, 242, .15); }
+.edp .edp-day.edp-out { color: var(--edp-muted); }                  /* adjacent-month days */
+.edp .edp-day.edp-today { border-color: var(--edp-today); font-weight: 700; }
+.edp .edp-day.edp-selected,
+.edp .edp-day.edp-selected:hover {
+  background: var(--edp-accent);
+  color: var(--edp-accent-text);
+  border-color: var(--edp-accent);
+}
+.edp .edp-day:disabled {
+  color: #c8c8c8;
+  text-decoration: line-through;
+  cursor: not-allowed;
+  background: none;
+}
+.edp .edp-day:focus-visible,
+.edp .edp-nav:focus-visible { outline: 2px solid var(--edp-accent); outline-offset: 1px; }
+</style>
+
+<script>
+/* ===================================================================
+   2. SCRIPT
+   Wrapped in an IIFE so no variables leak into the global scope.
+   The only global is  window.attachDatePicker.
+   =================================================================== */
+(function () {
+  'use strict';
+
+  /* Guard: if this snippet is pasted twice (e.g. Integration + a Code
+     Module) do not initialise twice. */
+  if (window.attachDatePicker) { return; }
+
+  /* ---------------------------------------------------------------
+     2.1  CONSTANTS & STATE
+     --------------------------------------------------------------- */
+  var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
+                'July', 'August', 'September', 'October', 'November', 'December'];
+  var WEEKDAYS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
+
+  var registrations = [];          // [{selector, options}] from attachDatePicker()
+  var bound = new WeakMap();       // input -> options  (prevents duplicate init)
+
+  var popup = null;                // the single shared popup element (lazy)
+  var els = {};                    // cached popup children (title, grid, prev, next)
+  var activeInput = null;          // input the popup is currently serving
+  var activeOpts = null;
+  var viewYear = 0, viewMonth = 0; // month currently displayed (month is 0-11)
+  var rafPos = 0, rafScan = 0;     // requestAnimationFrame handles (throttling)
+
+  /* ---------------------------------------------------------------
+     2.2  DATE HELPERS  (all LOCAL time, never UTC, to avoid
+          off-by-one-day bugs)
+     --------------------------------------------------------------- */
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+
+  /* Strip the time so two dates on the same day compare equal. */
+  function startOfDay(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+
+  /* Date -> "MM/DD/YYYY" */
+  function format(d) {
+    return pad(d.getMonth() + 1) + '/' + pad(d.getDate()) + '/' + d.getFullYear();
+  }
+
+  /* "MM/DD/YYYY" (also accepts M/D/YYYY) -> Date, or null if invalid.
+     Rejects things like 02/31/2026 by round-tripping the parts. */
+  function parse(str) {
+    var m = /^\s*(\d{1,2})\/(\d{1,2})\/(\d{4})\s*$/.exec(str || '');
+    if (!m) { return null; }
+    var y = +m[3], mo = +m[1] - 1, d = +m[2];
+    var date = new Date(y, mo, d);
+    return (date.getFullYear() === y && date.getMonth() === mo && date.getDate() === d) ? date : null;
+  }
+
+  /* minDate / maxDate may be 'today', a "MM/DD/YYYY" string, a Date, or empty. */
+  function normalizeBound(v) {
+    if (!v) { return null; }
+    if (v === 'today') { return startOfDay(new Date()); }
+    if (v instanceof Date) { return isNaN(v) ? null : startOfDay(v); }
+    return parse(String(v));
+  }
+
+  function sameDay(a, b) { return !!a && !!b && a.getTime() === b.getTime(); }
+
+  /* Is this day selectable under the given options? */
+  function isDisabled(date, o) {
+    if (o.min && date < o.min) { return true; }
+    if (o.max && date > o.max) { return true; }
+    if (o.disableWeekends) {
+      var w = date.getDay();
+      if (w === 0 || w === 6) { return true; }
+    }
+    return false;
+  }
+
+  /* ---------------------------------------------------------------
+     2.3  POPUP CREATION  (once, appended to <body> so no parent with
+          overflow:hidden / transform can clip it)
+     --------------------------------------------------------------- */
+  function buildPopup() {
+    popup = document.createElement('div');
+    popup.className = 'edp';
+    popup.setAttribute('role', 'dialog');
+    popup.setAttribute('aria-label', 'Choose a date');
+
+    popup.innerHTML =
+      '<div class="edp-head">' +
+        '<button type="button" class="edp-nav edp-prev" aria-label="Previous month">&#8249;</button>' +
+        '<div class="edp-title" aria-live="polite"></div>' +
+        '<button type="button" class="edp-nav edp-next" aria-label="Next month">&#8250;</button>' +
+      '</div>' +
+      '<div class="edp-week">' +
+        WEEKDAYS.map(function (d) { return '<span>' + d + '</span>'; }).join('') +
+      '</div>' +
+      '<div class="edp-grid"></div>';
+
+    els.title = popup.querySelector('.edp-title');
+    els.grid  = popup.querySelector('.edp-grid');
+    els.prev  = popup.querySelector('.edp-prev');
+    els.next  = popup.querySelector('.edp-next');
+
+    /* Keep focus in the input while the user clicks inside the popup,
+       otherwise the input's blur/outside logic would fire. */
+    popup.addEventListener('mousedown', function (e) { e.preventDefault(); });
+
+    els.prev.addEventListener('click', function () { shiftMonth(-1); });
+    els.next.addEventListener('click', function () { shiftMonth(1); });
+
+    /* One delegated listener for all day buttons. */
+    els.grid.addEventListener('click', function (e) {
+      var btn = e.target.closest ? e.target.closest('.edp-day') : null;
+      if (btn && !btn.disabled) {
+        selectDate(new Date(+btn.getAttribute('data-y'), +btn.getAttribute('data-m'), +btn.getAttribute('data-d')));
+      }
+    });
+
+    document.body.appendChild(popup);
+  }
+
+  /* ---------------------------------------------------------------
+     2.4  RENDERING THE MONTH GRID
+     --------------------------------------------------------------- */
+  function render() {
+    var o = activeOpts;
+    var today = startOfDay(new Date());
+    var selected = parse(activeInput.value);
+
+    els.title.textContent = MONTHS[viewMonth] + ' ' + viewYear;
+
+    var first = new Date(viewYear, viewMonth, 1);
+    var gridStart = new Date(viewYear, viewMonth, 1 - first.getDay()); // Sunday on/before the 1st
+    var html = '';
+
+    /* Always 6 rows x 7 = 42 cells so the popup height never jumps. */
+    for (var i = 0; i < 42; i++) {
+      var d = new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i);
+      var cls = 'edp-day';
+      if (d.getMonth() !== viewMonth) { cls += ' edp-out'; }
+      if (sameDay(d, today))          { cls += ' edp-today'; }
+      if (sameDay(d, selected))       { cls += ' edp-selected'; }
+      html += '<button type="button" class="' + cls + '"' +
+              ' data-y="' + d.getFullYear() + '" data-m="' + d.getMonth() + '" data-d="' + d.getDate() + '"' +
+              (isDisabled(d, o) ? ' disabled' : '') +
+              (sameDay(d, selected) ? ' aria-pressed="true"' : '') + '>' + d.getDate() + '</button>';
+    }
+    els.grid.innerHTML = html;
+
+    /* Disable month arrows when the whole neighbouring month is out of range. */
+    var lastOfPrev  = new Date(viewYear, viewMonth, 0);
+    var firstOfNext = new Date(viewYear, viewMonth + 1, 1);
+    els.prev.disabled = !!(o.min && lastOfPrev < o.min);
+    els.next.disabled = !!(o.max && firstOfNext > o.max);
+  }
+
+  function shiftMonth(delta) {
+    var d = new Date(viewYear, viewMonth + delta, 1);
+    viewYear = d.getFullYear();
+    viewMonth = d.getMonth();
+    render();
+    position();               // height is constant, but cheap and safe
+  }
+
+  /* ---------------------------------------------------------------
+     2.5  POSITIONING  (fixed popup, coordinates from getBoundingClientRect)
+     --------------------------------------------------------------- */
+  function position() {
+    if (!popup || !activeInput || !popup.classList.contains('edp-open')) { return; }
+
+    var r = activeInput.getBoundingClientRect();
+    var pw = popup.offsetWidth, ph = popup.offsetHeight;
+    var vw = document.documentElement.clientWidth;
+    var vh = document.documentElement.clientHeight;
+    var gap = 4;
+
+    /* Prefer below the field; flip above if it doesn't fit and there is more room above. */
+    var top = r.bottom + gap;
+    if (top + ph > vh && r.top - gap - ph >= 0) { top = r.top - gap - ph; }
+
+    /* Left-align with the field, then clamp into the viewport. */
+    var left = Math.max(8, Math.min(r.left, vw - pw - 8));
+
+    popup.style.top = Math.round(top) + 'px';
+    popup.style.left = Math.round(left) + 'px';
+
+    /* If the field itself scrolled completely out of view, close. */
+    if (r.bottom < 0 || r.top > vh) { close(); }
+  }
+
+  /* Throttle to one update per animation frame. */
+  function schedulePosition() {
+    if (rafPos) { return; }
+    rafPos = requestAnimationFrame(function () { rafPos = 0; position(); });
+  }
+
+  /* ---------------------------------------------------------------
+     2.6  OPEN / CLOSE / SELECT
+     --------------------------------------------------------------- */
+  function open(input, opts) {
+    if (!popup) { buildPopup(); }
+    activeInput = input;
+    activeOpts = opts;
+
+    /* Show the month of the current value if valid, else the current month. */
+    var base = parse(input.value) || startOfDay(new Date());
+    /* If today is outside the allowed range, jump to the nearest allowed month. */
+    if (!parse(input.value)) {
+      if (opts.min && base < opts.min) { base = opts.min; }
+      else if (opts.max && base > opts.max) { base = opts.max; }
+    }
+    viewYear = base.getFullYear();
+    viewMonth = base.getMonth();
+
+    render();
+    popup.classList.add('edp-open');
+    position();
+  }
+
+  function close() {
+    if (popup) { popup.classList.remove('edp-open'); }
+    activeInput = null;
+    activeOpts = null;
+  }
+
+  function selectDate(date) {
+    var input = activeInput;
+    if (!input) { return; }
+    input.value = format(date);
+    /* Notify Divi (validation, conditional logic) and any other listeners. */
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    close();
+  }
+
+  /* ---------------------------------------------------------------
+     2.7  GLOBAL LISTENERS (added once)
+     --------------------------------------------------------------- */
+  /* Click / tap outside the popup and outside the active field closes it. */
+  document.addEventListener('mousedown', onOutside, true);
+  document.addEventListener('touchstart', onOutside, true);
+  function onOutside(e) {
+    if (!popup || !activeInput) { return; }
+    if (popup.contains(e.target) || e.target === activeInput) { return; }
+    close();
+  }
+
+  /* Escape closes. */
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && activeInput) { close(); }
+  }, true);
+
+  /* Reposition when the page or ANY scrolling ancestor scrolls (capture = true
+     catches scroll events from nested containers, which don't bubble). */
+  window.addEventListener('scroll', schedulePosition, true);
+  window.addEventListener('resize', schedulePosition);
+
+  /* ---------------------------------------------------------------
+     2.8  BINDING AN INPUT
+     --------------------------------------------------------------- */
+  function bind(input, opts) {
+    if (bound.has(input)) { return; }          // duplicate-init guard
+    bound.set(input, opts);
+    input.setAttribute('autocomplete', 'off');
+    input.setAttribute('data-edp', '1');
+    if (!input.placeholder) { input.placeholder = 'MM/DD/YYYY'; }
+
+    var show = function () { open(input, opts); };
+    input.addEventListener('focus', show);
+    input.addEventListener('click', show);     // re-open after a selection while still focused
+
+    /* Tab away -> close. */
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Tab') { close(); }
+    });
+
+    /* Typing a valid date keeps the calendar in sync. */
+    input.addEventListener('input', function () {
+      if (activeInput !== input) { return; }
+      var d = parse(input.value);
+      if (d) { viewYear = d.getFullYear(); viewMonth = d.getMonth(); }
+      render();
+    });
+  }
+
+  /* Divi puts the CSS ID on the wrapper (<p class="et_pb_contact_field">),
+     so resolve to the real <input>. */
+  function resolveInput(el) {
+    if (!el) { return null; }
+    if (el.tagName === 'INPUT') { return el; }
+    return el.querySelector('input[type="text"], input:not([type]), input[type="date"], input');
+  }
+
+  /* ---------------------------------------------------------------
+     2.9  SCANNING + MUTATIONOBSERVER  (fields rendered after load)
+     --------------------------------------------------------------- */
+  function scan() {
+    for (var i = 0; i < registrations.length; i++) {
+      var reg = registrations[i];
+      var nodes;
+      try { nodes = document.querySelectorAll(reg.selector); } catch (err) { continue; }
+      for (var j = 0; j < nodes.length; j++) {
+        var input = resolveInput(nodes[j]);
+        if (input) {
+          /* type="date" would show the browser's native picker; force text. */
+          if (input.type === 'date') { try { input.type = 'text'; } catch (e2) {} }
+          bind(input, reg.options);
+        }
+      }
+    }
+  }
+
+  /* Coalesce bursts of DOM mutations into one scan per frame. */
+  function scheduleScan() {
+    if (rafScan) { return; }
+    rafScan = requestAnimationFrame(function () { rafScan = 0; scan(); });
+  }
+
+  /* Observe from <html> so it works even when this script runs before <body>
+     is fully parsed (the "Add code to the <body>" slot). */
+  var observer = new MutationObserver(scheduleScan);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  /* ---------------------------------------------------------------
+     2.10  PUBLIC API
+     --------------------------------------------------------------- */
+  window.attachDatePicker = function (selector, options) {
+    var opts = options || {};
+    registrations.push({
+      selector: selector,
+      options: {
+        min: normalizeBound(opts.minDate),
+        max: normalizeBound(opts.maxDate),
+        disableWeekends: !!opts.disableWeekends
+      }
+    });
+    scan();                          // handle fields already on the page
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', scan);
+    }
+  };
+})();
+</script>
+
+<script>
+/* ===================================================================
+   3. EXAMPLE USAGE  -  edit / delete to suit your form.
+   Set each contact-form field's CSS ID in Divi first.
+   =================================================================== */
+
+/* Simplest form: any date allowed. */
+attachDatePicker('#booking_date');
+
+/* With options:
+     minDate          'today' | 'MM/DD/YYYY'
+     maxDate          'MM/DD/YYYY'
+     disableWeekends  true | false                                     */
+attachDatePicker('#service_date', {
+  minDate: 'today',
+  maxDate: '12/31/2027',
+  disableWeekends: false
+});
+</script>
